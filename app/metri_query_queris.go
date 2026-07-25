@@ -1,0 +1,235 @@
+/*
+ *@author  chengkenli
+ *@project StarRocksProbe
+ *@package app
+ *@file    metri_queris
+ *@date    2025/5/27 10:17
+ */
+
+package app
+
+import (
+	"StarRocksProbe/tools"
+	"StarRocksProbe/util"
+	"fmt"
+	"github.com/antchfx/htmlquery"
+	"github.com/gin-gonic/gin"
+	"github.com/go-resty/resty/v2"
+	"github.com/patrickmn/go-cache"
+	"golang.org/x/net/html"
+	"gorm.io/gorm"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+var (
+	queryMutexMap = make(map[string]*sync.Mutex)
+	mutexMapMutex sync.Mutex
+)
+
+func (engine *threadMap) metriQuery(c *gin.Context) {
+	appid := c.GetHeader("AppID")
+	if appid == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"msg": "app is nil."})
+		return
+	}
+	// 获取或创建该 appid 的专用锁
+	mutexMapMutex.Lock()
+	mu, exists := queryMutexMap[appid]
+	if !exists {
+		mu = &sync.Mutex{}
+		queryMutexMap[appid] = mu
+	}
+	mutexMapMutex.Unlock()
+	// 加锁，确保同一 appid 的请求串行执行
+	mu.Lock()
+	defer mu.Unlock()
+	// 检查缓存（在锁内检查，避免缓存击穿）
+	if v, ok := querycache.Get(appid + "queries"); ok {
+		c.JSON(http.StatusOK, v.([]util.GlobalQueries))
+		return
+	}
+	appid = setdefault(appid)
+	db, err := engine.getmapConnect(appid)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, nil)
+		return
+	}
+	var data []util.GlobalQueries
+	if tools.Version(appid, db) >= 3.3 {
+		data = globalqueries(appid, db)
+		// 当前队列信息获取
+		runqueries(appid, db)
+	} else {
+		restys, err := engine.getmapResty(appid)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, nil)
+			return
+		}
+		data = uriqueries(restys, db, appid, leader(db))
+	}
+	querycache.Set(appid+"queries", data, cache.DefaultExpiration)
+	c.JSON(http.StatusOK, data)
+}
+
+// 全局查询队列
+func globalqueries(app string, db *gorm.DB) []util.GlobalQueries {
+	var m, n []util.GlobalQueries
+	r := db.Raw("show proc '/global_current_queries'").Scan(&m)
+	if r.Error != nil {
+		util.Loggrs.Error(r.Error.Error())
+		return m
+	}
+	for _, item := range m {
+		if item.ConnectionId == 0 || strings.Split(item.ScanRows, " ")[0] == "0" {
+			continue
+		}
+		second20cache.Set(fmt.Sprintf("%s.%d", app, item.ConnectionId), item, cache.DefaultExpiration)
+		n = append(n, item)
+	}
+	return sortByScanRowsDesc(n)
+}
+
+// 单一的队列模式
+func runqueries(app string, db *gorm.DB) (result []util.RunQueries) {
+	var m []map[string]interface{}
+	r := db.Raw("SHOW RUNNING QUERIES").Scan(&m)
+	if r.Error != nil {
+		util.Loggrs.Error(r.Error.Error())
+		return
+	}
+	for _, item := range m {
+		data := util.RunQueries{
+			Dop:             item["DOP"].(string),
+			FeStartTime:     item["FeStartTime"].(string),
+			Fragments:       item["Fragments"].(string),
+			Frontend:        item["Frontend"].(string),
+			PendingTimeout:  item["PendingTimeout"].(string),
+			QueryID:         item["QueryId"].(string),
+			QueryTimeout:    item["QueryTimeout"].(string),
+			ResourceGroupID: item["ResourceGroupId"].(string),
+			Slots:           item["Slots"].(string),
+			StartTime:       item["StartTime"].(string),
+			State:           item["State"].(string),
+		}
+		result = append(result, data)
+		second20cache.Set(fmt.Sprintf("%s.%s", app, item["QueryId"].(string)), data, cache.DefaultExpiration)
+	}
+	return
+}
+
+func uriqueries(client *resty.Client, db *gorm.DB, app, fe string) []util.GlobalQueries {
+
+	var resource []util.GlobalQueries
+	uri := fmt.Sprintf(`http://%s:8030/system?path=//current_queries`, fe)
+	//创建Resty客户端
+	//发送POST请求并处理响应
+	respones, err := client.R().Get(uri)
+	if err != nil {
+		fmt.Println(err.Error())
+		return nil
+	}
+	menu, _ := htmlquery.Parse(strings.NewReader(string(respones.Body())))
+	table := htmlquery.Find(menu, `//*[@id="table_id"]/tbody/tr`)
+	for _, node := range table {
+		tr := htmlquery.Find(node, "td")
+		if len(tr) >= 11 {
+			//var wh string
+			//if len(tr) == 12 {
+			//	wh = td(tr[11])
+			//}
+			if tools.Version(app, db) >= 3.3 {
+				id, _ := strconv.Atoi(split(td(tr[3])))
+				if id == 0 {
+					continue
+				}
+				scanBytes := int64(tools.Size(td(tr[6])))
+				memoryUsage := int64(tools.Size(td(tr[8])))
+				scanRows, _ := strconv.Atoi(split(td(tr[7])))
+				cpuTime, _ := strconv.ParseFloat(split(td(tr[10])), 64)
+				excTime, _ := strconv.ParseFloat(split(td(tr[11])), 64)
+				if scanRows == 0 && scanBytes == 0 && memoryUsage == 0 && cpuTime == 0 {
+					continue
+				}
+				resource = append(resource,
+					util.GlobalQueries{
+						StartTime:     "",
+						QueryId:       "",
+						ConnectionId:  int64(id),
+						Database:      "",
+						User:          td(tr[5]),
+						ScanBytes:     fmt.Sprintf("%d", scanBytes),
+						ScanRows:      fmt.Sprintf("%d", scanRows),
+						MemoryUsage:   fmt.Sprintf("%d", memoryUsage),
+						DiskSpillSize: "",
+						CPUTime:       fmt.Sprintf("%0.1f", cpuTime),
+						ExecTime:      fmt.Sprintf("%0.1f", excTime),
+						Warehouse:     "",
+						CustomQueryId: "",
+						ResourceGroup: "",
+					})
+			} else {
+				id, _ := strconv.Atoi(split(td(tr[2])))
+				if id == 0 {
+					continue
+				}
+				scanBytes := int64(tools.Size(td(tr[5])))
+				memoryUsage := int64(tools.Size(td(tr[7])))
+				scanRows, _ := strconv.Atoi(split(td(tr[6])))
+				cpuTime, _ := strconv.ParseFloat(split(td(tr[9])), 64)
+				excTime, _ := strconv.ParseFloat(split(td(tr[10])), 64)
+				if scanRows == 0 && scanBytes == 0 && memoryUsage == 0 && cpuTime == 0 {
+					continue
+				}
+				resource = append(resource,
+					util.GlobalQueries{
+						StartTime:     "",
+						QueryId:       "",
+						ConnectionId:  int64(id),
+						Database:      "",
+						User:          td(tr[5]),
+						ScanBytes:     fmt.Sprintf("%d", scanBytes),
+						ScanRows:      fmt.Sprintf("%d", scanRows),
+						MemoryUsage:   fmt.Sprintf("%d", memoryUsage),
+						DiskSpillSize: "",
+						CPUTime:       fmt.Sprintf("%0.1f", cpuTime),
+						ExecTime:      fmt.Sprintf("%0.1f", excTime),
+						Warehouse:     "",
+						CustomQueryId: "",
+						ResourceGroup: "",
+					})
+			}
+		}
+	}
+	return resource
+}
+
+func td(n *html.Node) string {
+	v := htmlquery.InnerText(n)
+	return v
+}
+
+func split(str string) string {
+	return strings.Split(str, " ")[0]
+}
+
+func sortByScanRowsDesc(queries []util.GlobalQueries) []util.GlobalQueries {
+	// 复制切片以避免修改原数据
+	sorted := make([]util.GlobalQueries, len(queries))
+	copy(sorted, queries)
+
+	// 按 ScanRows 降序排序
+	sort.Slice(sorted, func(i, j int) bool {
+		inum := strings.Split(sorted[i].ScanRows, " ")[0]
+		jnum := strings.Split(sorted[j].ScanRows, " ")[0]
+		// 将 ScanRows 从字符串转为 int64 进行比较
+		valI, _ := strconv.ParseInt(inum, 10, 64)
+		valJ, _ := strconv.ParseInt(jnum, 10, 64)
+		return valI > valJ // 降序
+	})
+
+	return sorted
+}
